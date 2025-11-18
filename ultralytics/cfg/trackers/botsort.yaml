@@ -18,4 +18,7 @@ gmc_method: sparseOptFlow # (str) Global motion compensation: sparseOptFlow|orb|
 proximity_thresh: 0.5 # (float) Min IoU to consider tracks proximate for ReID; higher is stricter
 appearance_thresh: 0.8 # (float) Min appearance similarity for ReID; raise to avoid identity swaps
 with_reid: False # (bool) Enable ReID model use; needs extra model and compute
-model: auto # (str) ReID model name/path; "auto" uses detector features if available
+reid_type: auto # (str) ReID model type: "yolo", "osnet-onnx", or "auto" for auto-detection
+model: auto # (str) ReID model path; "auto" uses detector features, or path to .pt/.onnx/.engine file
+input_size: [256, 128] # (list) Input size [height, width] for OSNet models
+use_tensorrt: True # (bool) Enable TensorRT acceleration for ONNX/Engine models

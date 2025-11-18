@@ -13,6 +13,7 @@ from ultralytics.utils.plotting import save_one_box
 
 from .basetrack import TrackState
 from .byte_tracker import BYTETracker, STrack
+from .reid_models import build_reid_encoder
 from .utils import matching
 from .utils.gmc import GMC
 from .utils.kalman_filter import KalmanFilterXYWH
@@ -196,13 +197,22 @@ class BOTSORT(BYTETracker):
         # ReID module
         self.proximity_thresh = args.proximity_thresh
         self.appearance_thresh = args.appearance_thresh
-        self.encoder = (
-            (lambda feats, s: [f.cpu().numpy() for f in feats])  # native features do not require any model
-            if args.with_reid and self.args.model == "auto"
-            else ReID(args.model)
-            if args.with_reid
-            else None
-        )
+
+        # Initialize ReID encoder based on configuration
+        self.encoder = None
+        if args.with_reid:
+            if self.args.model == "auto":
+                # Use detector's native features (original behavior)
+                self.encoder = lambda feats, s: [f.cpu().numpy() for f in feats]
+            else:
+                # Use external ReID model (YOLO or OSNet)
+                self.encoder = build_reid_encoder(
+                    model_type=getattr(args, "reid_type", "auto"),
+                    model_path=args.model,
+                    input_size=getattr(args, "input_size", (256, 128)),
+                    use_tensorrt=getattr(args, "use_tensorrt", True),
+                    device=getattr(args, "device", 0),
+                )
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
         """Return an instance of KalmanFilterXYWH for predicting and updating object states in the tracking process."""
@@ -243,27 +253,3 @@ class BOTSORT(BYTETracker):
         """Reset the BOTSORT tracker to its initial state, clearing all tracked objects and internal states."""
         super().reset()
         self.gmc.reset_params()
-
-
-class ReID:
-    """YOLO model as encoder for re-identification."""
-
-    def __init__(self, model: str):
-        """Initialize encoder for re-identification.
-
-        Args:
-            model (str): Path to the YOLO model for re-identification.
-        """
-        from ultralytics import YOLO
-
-        self.model = YOLO(model)
-        self.model(embed=[len(self.model.model.model) - 2 if ".pt" in model else -1], verbose=False, save=False)  # init
-
-    def __call__(self, img: np.ndarray, dets: np.ndarray) -> list[np.ndarray]:
-        """Extract embeddings for detected objects."""
-        feats = self.model.predictor(
-            [save_one_box(det, img, save=False) for det in xywh2xyxy(torch.from_numpy(dets[:, :4]))]
-        )
-        if len(feats) != dets.shape[0] and feats[0].shape[0] == dets.shape[0]:
-            feats = feats[0]  # batched prediction with non-PyTorch backend
-        return [f.cpu().numpy() for f in feats]
