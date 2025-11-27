@@ -144,9 +144,9 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
         self.mean = np.array([0.485, 0.456, 0.406], dtype=dtype).reshape(1, 3, 1, 1)
         self.std = np.array([0.229, 0.224, 0.225], dtype=dtype).reshape(1, 3, 1, 1)
         
-        # Batch inference support flag (auto-detect on first call)
-        self._batch_inference_enabled = None
-        self._batch_tested = False
+        # Fixed batch size for TensorRT optimization
+        self.fixed_batch_size = 4  # TensorRT 固定 batch，避免动态编译
+        self._use_fixed_batch = True  # 启用固定 batch 优化
 
     def _setup_providers(self, use_tensorrt: bool) -> list:
         """Setup ONNX Runtime execution providers with TensorRT priority.
@@ -223,7 +223,7 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
         return img_tensor.astype(np.float16 if self.use_fp16 else np.float32)
 
     def __call__(self, img: np.ndarray, dets: np.ndarray) -> list[np.ndarray]:
-        """Extract ReID features from detections using OSNet.
+        """Extract ReID features from detections using OSNet with fixed batch size.
 
         Args:
             img (np.ndarray): Full image (H, W, 3) in BGR format.
@@ -237,19 +237,19 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
 
         num_dets = len(dets)
         
-        # Test batch inference on first call with multiple detections
-        if not self._batch_tested and num_dets > 1:
-            self._test_batch_inference()
-        
-        # Use batch inference if enabled and supported
-        if self._batch_inference_enabled and num_dets > 1:
+        # Use fixed batch size inference for TensorRT stability
+        # 注意：即使只有1个detection，也使用fixed batch（会padding到fixed_batch_size）
+        if self._use_fixed_batch:
             try:
-                return self._batch_inference(img, dets)
+                return self._fixed_batch_inference(img, dets)
             except Exception as e:
-                LOGGER.warning(f"Batch inference failed: {e}, falling back to sequential")
-                self._batch_inference_enabled = False  # Disable for future calls
+                LOGGER.warning(f"Fixed batch inference failed: {e}, falling back to sequential")
+                self._use_fixed_batch = False  # Disable for future calls
         
-        # Sequential inference (original implementation)
+        # Sequential inference (fallback) - 不适用于固定batch模型
+        # 警告：如果模型是固定batch导出的，这部分会报错
+        LOGGER.warning(f"⚠️ Using sequential inference for {num_dets} detections. "
+                      f"If model has fixed batch size, this will fail!")
         features = []
         for det in xywh2xyxy(torch.from_numpy(dets[:, :4])):
             # Crop detection from full image
@@ -269,54 +269,13 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
 
         return features
     
-    def _test_batch_inference(self):
-        """Test if batch inference is supported by the model."""
-        self._batch_tested = True
+    def _fixed_batch_inference(self, img: np.ndarray, dets: np.ndarray) -> list[np.ndarray]:
+        """Fixed batch size inference to avoid TensorRT dynamic recompilation.
         
-        # Conservative approach: disable batch inference by default for safety
-        # Only enable if model explicitly supports dynamic batch
-        try:
-            # Check model input shape
-            input_shape = self.session.get_inputs()[0].shape
-            
-            # If first dimension is fixed (not dynamic), disable batch inference
-            if isinstance(input_shape[0], int) and input_shape[0] == 1:
-                self._batch_inference_enabled = False
-                LOGGER.info("Model has fixed batch_size=1, using sequential inference")
-                return
-            
-            # Try a quick batch inference test
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-            
-            dummy_batch = np.zeros((2, 3, self.input_size[0], self.input_size[1]), 
-                                   dtype=np.float16 if self.use_fp16 else np.float32)
-            
-            def test_inference():
-                return self.session.run([self.output_name], {self.input_name: dummy_batch})
-            
-            # Run with 3 second timeout
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(test_inference)
-                try:
-                    outputs = future.result(timeout=3.0)
-                    if outputs[0].shape[0] == 2:
-                        self._batch_inference_enabled = True
-                        LOGGER.info("✅ Batch inference enabled for ReID model")
-                    else:
-                        self._batch_inference_enabled = False
-                except FutureTimeoutError:
-                    self._batch_inference_enabled = False
-                    LOGGER.warning("Batch inference test timeout, using sequential inference")
-                except Exception as e:
-                    self._batch_inference_enabled = False
-                    LOGGER.info(f"Batch inference not supported: {e}")
-                    
-        except Exception as e:
-            self._batch_inference_enabled = False
-            LOGGER.info(f"Batch inference test failed, using sequential: {e}")
-    
-    def _batch_inference(self, img: np.ndarray, dets: np.ndarray) -> list[np.ndarray]:
-        """Batch inference for multiple detections.
+        Strategy:
+        - Split detections into chunks of fixed_batch_size
+        - Pad last chunk if necessary
+        - TensorRT only compiles once for the fixed batch size
         
         Args:
             img (np.ndarray): Full image.
@@ -327,50 +286,64 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
         """
         import cv2
         
-        # Convert detections to xyxy format once
+        num_dets = len(dets)
+        batch_size = self.fixed_batch_size
+        
+        # Convert all detections to xyxy format
         xyxy_dets = xywh2xyxy(torch.from_numpy(dets[:, :4]))
-        batch_size = len(xyxy_dets)
         
-        # Pre-allocate batch tensor
+        # Prepare for batch processing
+        all_features = []
         dtype = np.float16 if self.use_fp16 else np.float32
-        batch_tensor = np.empty((batch_size, 3, self.input_size[0], self.input_size[1]), dtype=dtype)
+        target_size = (self.input_size[1], self.input_size[0])
+        mean_val = self.mean[0]
+        std_val = self.std[0]
         
-        # Optimized batch preprocessing
-        target_size = (self.input_size[1], self.input_size[0])  # (W, H) for cv2.resize
-        mean_val = self.mean[0]  # Shape: (3, 1, 1)
-        std_val = self.std[0]    # Shape: (3, 1, 1)
-        
-        for i, det in enumerate(xyxy_dets):
-            # Crop detection (inline to avoid function call overhead)
-            x1, y1, x2, y2 = int(det[0]), int(det[1]), int(det[2]), int(det[3])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
-            img_crop = img[y1:y2, x1:x2]
+        # Process in fixed-size batches
+        for start_idx in range(0, num_dets, batch_size):
+            end_idx = min(start_idx + batch_size, num_dets)
+            chunk_size = end_idx - start_idx
             
-            # Skip invalid crops
-            if img_crop.size == 0:
-                continue
+            # Create fixed-size batch tensor (always fixed_batch_size)
+            batch_tensor = np.zeros((batch_size, 3, self.input_size[0], self.input_size[1]), dtype=dtype)
             
-            # Fast preprocessing pipeline
-            img_rgb = cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB)  # Faster than slicing [:,:,::-1]
-            img_resized = cv2.resize(img_rgb, target_size, interpolation=cv2.INTER_LINEAR)
+            # Fill batch with actual detections
+            for i in range(chunk_size):
+                det = xyxy_dets[start_idx + i]
+                
+                # Crop detection (inline for speed)
+                x1, y1, x2, y2 = int(det[0]), int(det[1]), int(det[2]), int(det[3])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+                img_crop = img[y1:y2, x1:x2]
+                
+                if img_crop.size == 0:
+                    continue
+                
+                # Preprocess
+                img_rgb = cv2.cvtColor(img_crop, cv2.COLOR_BGR2RGB)
+                img_resized = cv2.resize(img_rgb, target_size, interpolation=cv2.INTER_LINEAR)
+                img_normalized = img_resized.astype(np.float32) * (1.0 / 255.0)
+                img_chw = np.transpose(img_normalized, (2, 0, 1))
+                batch_tensor[i] = (img_chw - mean_val) / std_val
             
-            # Vectorized normalization
-            img_normalized = img_resized.astype(np.float32) * (1.0 / 255.0)
-            img_chw = np.transpose(img_normalized, (2, 0, 1))  # HWC -> CHW
+            # Pad remaining slots with zeros (if chunk_size < batch_size)
+            # TensorRT will process the full batch, but we only use chunk_size results
             
-            # Apply ImageNet normalization
-            batch_tensor[i] = (img_chw - mean_val) / std_val
+            # Fixed batch inference (always same batch_size, TensorRT compiles once)
+            outputs = self.session.run([self.output_name], {self.input_name: batch_tensor})
+            feats = outputs[0]  # Shape: (batch_size, feature_dim)
+            
+            # Only keep valid features (first chunk_size)
+            valid_feats = feats[:chunk_size]
+            
+            # L2 normalization
+            norms = np.linalg.norm(valid_feats, axis=1, keepdims=True) + 1e-12
+            valid_feats = valid_feats / norms
+            
+            all_features.extend([feat for feat in valid_feats])
         
-        # Batch inference
-        outputs = self.session.run([self.output_name], {self.input_name: batch_tensor})
-        feats = outputs[0]  # Shape: (N, feature_dim)
-        
-        # Vectorized L2 normalization
-        norms = np.linalg.norm(feats, axis=1, keepdims=True) + 1e-12
-        feats = feats / norms
-        
-        return [feat for feat in feats]
+        return all_features
 
 
 def build_reid_encoder(model_type: str, model_path: str, **kwargs):
