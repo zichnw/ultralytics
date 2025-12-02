@@ -174,8 +174,10 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
                 "trt_fp16_enable": True,  # Enable FP16 if engine supports it
                 "trt_engine_cache_enable": True,  # Cache compiled engines
                 "trt_engine_cache_path": str(self.model_path.parent),
-                'trt_timing_cache_enable': True,
-                'trt_timing_cache_path': str(self.model_path.parent),
+                "trt_timing_cache_enable": True,
+                "trt_timing_cache_path": str(self.model_path.parent),
+                "trt_dla_enable": True,         # 启用DLA
+                "trt_dla_core": 1,
             }
             providers.append(("TensorrtExecutionProvider", trt_options))
             LOGGER.info("🚀 TensorRT Execution Provider enabled")
