@@ -5,6 +5,7 @@ ReID models for object tracking with TensorRT support.
 Supports YOLO, OSNet (PyTorch/ONNX/TensorRT), and custom ReID models.
 """
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -15,6 +16,8 @@ import torch
 from ultralytics.utils import LOGGER
 from ultralytics.utils.ops import xywh2xyxy
 from ultralytics.utils.plotting import save_one_box
+
+from .track_profiler import get_profiler
 
 
 class BaseReIDEncoder:
@@ -215,6 +218,8 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
         if len(dets) == 0:
             return []
 
+        profiler = get_profiler()
+        
         # Prepare data
         xyxy_dets = xywh2xyxy(torch.from_numpy(dets[:, :4]))
         num_dets = len(xyxy_dets)
@@ -249,6 +254,7 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
             preprocessed_tensors[i] = img_tensor
 
         # Parallel preprocessing for larger batches
+        preprocess_start = time.perf_counter()
         if num_dets > 4:
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(max_workers=4)
@@ -256,8 +262,11 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
         else:
             for i, det in enumerate(xyxy_dets):
                 preprocess_one((i, det))
+        preprocess_time = (time.perf_counter() - preprocess_start) * 1000
+        profiler.add_time("reid_preprocess", preprocess_time)
 
         # Sequential inference (Batch Size = 1)
+        inference_start = time.perf_counter()
         features = []
         for tensor in preprocessed_tensors:
             if tensor is None:
@@ -271,6 +280,10 @@ class OSNetONNXReIDEncoder(BaseReIDEncoder):
             # L2 normalization
             feat = feat / (np.linalg.norm(feat) + 1e-12)
             features.append(feat.astype(np.float32))
+        
+        inference_time = (time.perf_counter() - inference_start) * 1000
+        profiler.add_time("reid_inference", inference_time)
+        profiler.add_time("reid_total", preprocess_time + inference_time)
 
         return features
 

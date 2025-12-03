@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Any
 
@@ -14,6 +15,7 @@ from ultralytics.utils.plotting import save_one_box
 from .basetrack import TrackState
 from .byte_tracker import BYTETracker, STrack
 from .reid_models import build_reid_encoder
+from .track_profiler import get_profiler
 from .utils import matching
 from .utils.gmc import GMC
 from .utils.kalman_filter import KalmanFilterXYWH
@@ -222,27 +224,41 @@ class BOTSORT(BYTETracker):
         """Initialize object tracks using detection bounding boxes, scores, class labels, and optional ReID features."""
         if len(results) == 0:
             return []
+        
+        profiler = get_profiler()
+        init_start = time.perf_counter()
+        
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
         if self.args.with_reid and self.encoder is not None:
             features_keep = self.encoder(img, bboxes)
-            return [BOTrack(xywh, s, c, f) for (xywh, s, c, f) in zip(bboxes, results.conf, results.cls, features_keep)]
+            tracks = [BOTrack(xywh, s, c, f) for (xywh, s, c, f) in zip(bboxes, results.conf, results.cls, features_keep)]
         else:
-            return [BOTrack(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
+            tracks = [BOTrack(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
+        
+        profiler.add_time("init_track", (time.perf_counter() - init_start) * 1000)
+        return tracks
 
     def get_dists(self, tracks: list[BOTrack], detections: list[BOTrack]) -> np.ndarray:
         """Calculate distances between tracks and detections using IoU and optionally ReID embeddings."""
+        profiler = get_profiler()
+        
+        iou_start = time.perf_counter()
         dists = matching.iou_distance(tracks, detections)
         dists_mask = dists > (1 - self.proximity_thresh)
+        profiler.add_time("iou_distance", (time.perf_counter() - iou_start) * 1000)
 
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
 
         if self.args.with_reid and self.encoder is not None:
+            emb_start = time.perf_counter()
             emb_dists = matching.embedding_distance(tracks, detections) / 2.0
             emb_dists[emb_dists > (1 - self.appearance_thresh)] = 1.0
             emb_dists[dists_mask] = 1.0
             dists = np.minimum(dists, emb_dists)
+            profiler.add_time("embedding_distance", (time.perf_counter() - emb_start) * 1000)
+        
         return dists
 
     def multi_predict(self, tracks: list[BOTrack]) -> None:

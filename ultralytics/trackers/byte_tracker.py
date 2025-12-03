@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,7 @@ import numpy as np
 from ..utils import LOGGER
 from ..utils.ops import xywh2ltwh
 from .basetrack import BaseTrack, TrackState
+from .track_profiler import get_profiler
 from .utils import matching
 from .utils.kalman_filter import KalmanFilterXYAH
 
@@ -293,6 +295,8 @@ class BYTETracker:
 
     def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None) -> np.ndarray:
         """Update the tracker with new detections and return the current list of tracked objects."""
+        profiler = get_profiler()
+        
         self.frame_id += 1
         activated_stracks = []
         refind_stracks = []
@@ -324,19 +328,30 @@ class BYTETracker:
         # Step 2: First association, with high score detection boxes
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
         # Predict the current location with KF
+        kalman_start = time.perf_counter()
         self.multi_predict(strack_pool)
+        profiler.add_time("kalman_predict", (time.perf_counter() - kalman_start) * 1000)
+        
         if hasattr(self, "gmc") and img is not None:
             # use try-except here to bypass errors from gmc module
+            gmc_start = time.perf_counter()
             try:
                 warp = self.gmc.apply(img, results.xyxy)
             except Exception:
                 warp = np.eye(2, 3)
             STrack.multi_gmc(strack_pool, warp)
             STrack.multi_gmc(unconfirmed, warp)
+            profiler.add_time("gmc", (time.perf_counter() - gmc_start) * 1000)
 
+        dists_start = time.perf_counter()
         dists = self.get_dists(strack_pool, detections)
+        profiler.add_time("get_dists", (time.perf_counter() - dists_start) * 1000)
+        
+        assign_start = time.perf_counter()
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
+        profiler.add_time("linear_assignment", (time.perf_counter() - assign_start) * 1000)
 
+        update_start = time.perf_counter()
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
@@ -398,6 +413,7 @@ class BYTETracker:
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
         self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+        profiler.add_time("track_update", (time.perf_counter() - update_start) * 1000)
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-999:]  # clip remove stracks to 1000 maximum

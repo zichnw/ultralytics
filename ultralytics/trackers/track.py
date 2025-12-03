@@ -1,5 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+import time
 from functools import partial
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from ultralytics.utils.checks import check_yaml
 
 from .bot_sort import BOTSORT
 from .byte_tracker import BYTETracker
+from .track_profiler import get_profiler, enable_profiling
 
 # A mapping of tracker types to corresponding tracker classes
 TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT}
@@ -38,6 +40,10 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
 
     if cfg.tracker_type not in {"bytetrack", "botsort"}:
         raise AssertionError(f"Only 'bytetrack' and 'botsort' are supported for now, but got '{cfg.tracker_type}'")
+
+    # Always enable profiler, save to predictor's save_dir or current working directory
+    output_dir = getattr(predictor, "save_dir", None) or Path.cwd()
+    enable_profiling(str(output_dir))
 
     predictor._feats = None  # reset in case used earlier
     if hasattr(predictor, "_hook"):
@@ -80,6 +86,7 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
         >>> predictor = YourPredictorClass()
         >>> on_predict_postprocess_end(predictor, persist=True)
     """
+    profiler = get_profiler()
     is_obb = predictor.args.task == "obb"
     is_stream = predictor.dataset.mode == "stream"
     for i, result in enumerate(predictor.results):
@@ -90,7 +97,17 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             predictor.vid_path[i if is_stream else 0] = vid_path
 
         det = (result.obb if is_obb else result.boxes).cpu().numpy()
+        
+        # Start frame timing
+        profiler.start_frame(tracker.frame_id + 1, len(det))
+        
+        tracker_start = time.perf_counter()
         tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
+        profiler.add_time("tracker_total", (time.perf_counter() - tracker_start) * 1000)
+        
+        # End frame timing
+        profiler.end_frame()
+        
         if len(tracks) == 0:
             continue
         idx = tracks[:, -1].astype(int)
@@ -114,3 +131,16 @@ def register_tracker(model: object, persist: bool) -> None:
     """
     model.add_callback("on_predict_start", partial(on_predict_start, persist=persist))
     model.add_callback("on_predict_postprocess_end", partial(on_predict_postprocess_end, persist=persist))
+    model.add_callback("on_predict_end", on_predict_end)
+
+
+def on_predict_end(predictor: object) -> None:
+    """Save profiling data when prediction ends.
+    
+    Args:
+        predictor (object): The predictor object.
+    """
+    profiler = get_profiler()
+    if profiler.is_enabled():
+        profiler.print_summary()
+        profiler.save_csv()

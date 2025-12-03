@@ -75,7 +75,12 @@ class GMC:
 
         elif self.method == "sparseOptFlow":
             self.feature_params = dict(
-                maxCorners=1000, qualityLevel=0.01, minDistance=1, blockSize=3, useHarrisDetector=False, k=0.04
+                maxCorners=500,  # Reduced from 1000 for better performance
+                qualityLevel=0.01,
+                minDistance=3,  # Increased from 1 to reduce redundant points
+                blockSize=3,
+                useHarrisDetector=False,
+                k=0.04,
             )
 
         elif self.method in {"none", "None", None}:
@@ -292,47 +297,56 @@ class GMC:
 
         # Downscale image for computational efficiency
         if self.downscale > 1.0:
-            frame = cv2.resize(frame, (width // self.downscale, height // self.downscale))
+            frame = cv2.resize(frame, (width // self.downscale, height // self.downscale), interpolation=cv2.INTER_LINEAR)
 
         # Find good features to track
         keypoints = cv2.goodFeaturesToTrack(frame, mask=None, **self.feature_params)
 
         # Handle first frame initialization
         if not self.initializedFirstFrame or self.prevKeyPoints is None:
-            self.prevFrame = frame.copy()
-            self.prevKeyPoints = copy.copy(keypoints)
+            self.prevFrame = frame
+            self.prevKeyPoints = keypoints
             self.initializedFirstFrame = True
             return H
 
+        # Skip if no keypoints detected
+        if keypoints is None or len(keypoints) < 5:
+            self.prevFrame = frame
+            self.prevKeyPoints = keypoints
+            return H
+
         # Calculate optical flow using Lucas-Kanade method
-        matchedKeypoints, status, _ = cv2.calcOpticalFlowPyrLK(self.prevFrame, frame, self.prevKeyPoints, None)
+        matchedKeypoints, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prevFrame, frame, self.prevKeyPoints, None,
+            winSize=(21, 21),  # Smaller window for speed
+            maxLevel=2,  # Reduce pyramid levels
+        )
 
-        # Extract successfully tracked points
-        prevPoints = []
-        currPoints = []
+        # Extract successfully tracked points using vectorized operations
+        status = status.flatten().astype(bool)
+        if np.sum(status) < 5:
+            self.prevFrame = frame
+            self.prevKeyPoints = keypoints
+            return H
 
-        for i in range(len(status)):
-            if status[i]:
-                prevPoints.append(self.prevKeyPoints[i])
-                currPoints.append(matchedKeypoints[i])
-
-        prevPoints = np.array(prevPoints)
-        currPoints = np.array(currPoints)
+        prevPoints = self.prevKeyPoints[status].reshape(-1, 2)
+        currPoints = matchedKeypoints[status].reshape(-1, 2)
 
         # Estimate transformation matrix using RANSAC
-        if (prevPoints.shape[0] > 4) and (prevPoints.shape[0] == currPoints.shape[0]):
+        if len(prevPoints) > 4:
             H, _ = cv2.estimateAffinePartial2D(prevPoints, currPoints, cv2.RANSAC)
-
-            # Scale translation components back to original resolution
-            if self.downscale > 1.0:
+            if H is None:
+                H = np.eye(2, 3)
+            elif self.downscale > 1.0:
+                # Scale translation components back to original resolution
                 H[0, 2] *= self.downscale
                 H[1, 2] *= self.downscale
         else:
             LOGGER.warning("not enough matching points")
 
-        # Store current frame data for next iteration
-        self.prevFrame = frame.copy()
-        self.prevKeyPoints = copy.copy(keypoints)
+        # Store current frame data for next iteration (avoid unnecessary copy)
+        self.prevFrame = frame
+        self.prevKeyPoints = keypoints
 
         return H
 
