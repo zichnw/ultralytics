@@ -63,6 +63,14 @@ class TrackProfiler:
         self.start_time = None
         self._measure_lock = Lock()
         
+        # Buffered writing to avoid per-frame file I/O
+        self._buffer = []
+        self._buffer_size = 1000  # Flush every 1000 frames to reduce I/O blocking
+        self._csv_file = None
+        self._csv_handle = None
+        self._csv_writer = None
+        self._header_written = False
+        
         # Define timing categories for consistent ordering
         self.timing_categories = [
             "frame_id",
@@ -99,11 +107,77 @@ class TrackProfiler:
         self.start_time = datetime.now()
         self.records = []
         self.frame_id = 0
-        LOGGER.info(f"📊 Track profiler enabled, output dir: {self.output_dir}")
+        
+        # Initialize CSV file for buffered writing
+        timestamp = self.start_time.strftime("%Y%m%d_%H%M%S")
+        self._csv_file = self.output_dir / f"track_profile_{timestamp}.csv"
+        self._buffer = []
+        self._header_written = False
+        self._csv_handle = None
+        self._csv_writer = None
+        
+        LOGGER.info(f"📊 Track profiler enabled, output: {self._csv_file}")
     
     def disable(self) -> None:
-        """Disable profiling."""
+        """Disable profiling and flush remaining data."""
+        self._flush_buffer()
+        self._close_csv()
         self.enabled = False
+    
+    def _open_csv(self) -> None:
+        """Open CSV file for writing (called once on first flush)."""
+        if self._csv_handle is None and self._csv_file is not None:
+            self._csv_handle = open(self._csv_file, "w", newline="", buffering=8192)
+    
+    def _close_csv(self) -> None:
+        """Close CSV file handle."""
+        if self._csv_handle is not None:
+            try:
+                self._csv_handle.flush()
+                self._csv_handle.close()
+            except Exception:
+                pass
+            finally:
+                self._csv_handle = None
+                self._csv_writer = None
+    
+    def _flush_buffer(self) -> None:
+        """Flush buffered records to CSV file."""
+        if not self._buffer:
+            return
+        
+        self._open_csv()
+        if self._csv_handle is None:
+            return
+        
+        # Collect all keys for columns
+        all_keys = set()
+        for record in self._buffer:
+            all_keys.update(record.keys())
+        
+        # Order columns
+        columns = []
+        for cat in self.timing_categories:
+            if cat in all_keys:
+                columns.append(cat)
+                all_keys.discard(cat)
+        columns.extend(sorted(all_keys))
+        
+        # Initialize writer if needed (first flush or after reset)
+        if self._csv_writer is None:
+            self._csv_writer = csv.DictWriter(self._csv_handle, fieldnames=columns)
+        
+        # Write header on first flush
+        if not self._header_written:
+            self._csv_writer.writeheader()
+            self._header_written = True
+        
+        # Write all buffered rows
+        for record in self._buffer:
+            row = {col: record.get(col, 0) for col in columns}
+            self._csv_writer.writerow(row)
+        
+        self._buffer = []
     
     def is_enabled(self) -> bool:
         """Check if profiling is enabled."""
@@ -174,55 +248,38 @@ class TrackProfiler:
         self.current_frame["num_detections"] = num_detections
     
     def end_frame(self) -> None:
-        """End timing for current frame and save record."""
+        """End timing for current frame and buffer record."""
         if not self.enabled:
             return
         with self._measure_lock:
-            self.records.append(dict(self.current_frame))
+            record = dict(self.current_frame)
+            self.records.append(record)  # Keep for summary stats
+            self._buffer.append(record)  # Buffer for CSV writing
             self.current_frame = defaultdict(float)
+            
+            # Flush buffer when full
+            if len(self._buffer) >= self._buffer_size:
+                self._flush_buffer()
     
     def save_csv(self, filename: Optional[str] = None) -> str:
-        """Save timing records to CSV file.
+        """Flush remaining buffer and finalize CSV file.
         
         Args:
-            filename (str, optional): Custom filename. Defaults to auto-generated name.
+            filename (str, optional): Ignored (file already created on enable).
             
         Returns:
             (str): Path to the saved CSV file.
         """
-        if not self.records:
-            LOGGER.warning("No timing records to save")
-            return ""
+        # Flush any remaining buffered data
+        self._flush_buffer()
+        self._close_csv()
         
-        if filename is None:
-            timestamp = self.start_time.strftime("%Y%m%d_%H%M%S") if self.start_time else datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"track_profile_{timestamp}.csv"
+        if self._csv_file and self._csv_file.exists():
+            LOGGER.info(f"📊 Saved {len(self.records)} timing records to {self._csv_file}")
+            return str(self._csv_file)
         
-        filepath = self.output_dir / filename
-        
-        # Collect all unique keys from records
-        all_keys = set()
-        for record in self.records:
-            all_keys.update(record.keys())
-        
-        # Order columns: predefined categories first, then any additional ones
-        columns = []
-        for cat in self.timing_categories:
-            if cat in all_keys:
-                columns.append(cat)
-                all_keys.discard(cat)
-        columns.extend(sorted(all_keys))
-        
-        with open(filepath, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=columns)
-            writer.writeheader()
-            for record in self.records:
-                # Fill missing values with 0
-                row = {col: record.get(col, 0) for col in columns}
-                writer.writerow(row)
-        
-        LOGGER.info(f"📊 Saved {len(self.records)} timing records to {filepath}")
-        return str(filepath)
+        LOGGER.warning("No timing records to save")
+        return ""
     
     def get_summary(self) -> dict:
         """Get summary statistics of timing data.
@@ -279,10 +336,14 @@ class TrackProfiler:
         LOGGER.info("=" * 70 + "\n")
     
     def reset(self) -> None:
-        """Reset all timing records."""
+        """Reset all timing records and close files."""
+        self._flush_buffer()
+        self._close_csv()
         self.records = []
+        self._buffer = []
         self.current_frame = defaultdict(float)
         self.frame_id = 0
+        self._header_written = False
 
 
 # Global profiler instance for easy access
